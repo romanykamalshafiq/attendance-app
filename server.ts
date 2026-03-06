@@ -1,207 +1,142 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
-import Database from "better-sqlite3";
+import mongoose from "mongoose";
 import path from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const db = new Database("attendance.db");
 
-// Initialize Database
-db.exec(`
-  CREATE TABLE IF NOT EXISTS students (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    stage TEXT NOT NULL,
-    class_name TEXT
-  );
+// --- 1. إعدادات MongoDB ---
+// استبدل الرابط التالي برابط MongoDB Atlas الخاص بك
+const MONGO_URI = "mongodb+srv://admin:password@cluster0.mongodb.net/ChurchAttendance?retryWrites=true&w=majority";
 
-  CREATE TABLE IF NOT EXISTS attendance (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    student_id INTEGER NOT NULL,
-    date TEXT NOT NULL,
-    status TEXT NOT NULL,
-    FOREIGN KEY (student_id) REFERENCES students (id)
-  );
+mongoose.connect(MONGO_URI)
+  .then(() => console.log("✅ متصل بـ MongoDB Atlas بنجاح"))
+  .catch(err => console.error("❌ فشل الاتصال بـ MongoDB:", err));
 
-  -- Migration for Grade 1 unification
-  UPDATE students SET stage = 'grade1-boys' WHERE stage IN ('grade1-boys-primary', 'grade1-boys-secondary', 'grade1-boys-a', 'grade1-boys-b', 'grade1-boys-1', 'grade1-boys-2');
-  UPDATE students SET stage = 'grade1-girls' WHERE stage IN ('grade1-girls-primary', 'grade1-girls-secondary', 'grade1-girls-a', 'grade1-girls-b', 'grade1-girls-1', 'grade1-girls-2');
-`);
+// --- 2. تعريف الموديلات (Schemas) ---
+const studentSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  stage: { type: String, required: true },
+  class_name: String
+});
+
+const attendanceSchema = new mongoose.Schema({
+  student_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Student', required: true },
+  date: { type: String, required: true }, // Format: YYYY-MM-DD
+  status: { type: String, enum: ['present', 'absent'], required: true }
+});
+
+const Student = mongoose.model('Student', studentSchema);
+const Attendance = mongoose.model('Attendance', attendanceSchema);
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = process.env.PORT || 3000;
 
   app.use(express.json({ limit: '50mb' }));
 
-  // API Routes
-  app.get("/api/students", (req, res) => {
+  // --- 3. الـ API Routes ---
+
+  // جلب الطلاب حسب المرحلة
+  app.get("/api/students", async (req, res) => {
     const { stage } = req.query;
-    let students;
-    if (stage) {
-      students = db.prepare("SELECT * FROM students WHERE stage = ?").all(stage);
-    } else {
-      students = db.prepare("SELECT * FROM students").all();
+    try {
+      const query = stage ? { stage } : {};
+      const students = await Student.find(query);
+      res.json(students);
+    } catch (error) {
+      res.status(500).json({ error: error.message });
     }
-    res.json(students);
   });
 
-  app.delete("/api/attendance/day", (req, res) => {
+  // حذف حضور يوم معين لمرحلة معينة
+  app.delete("/api/attendance/day", async (req, res) => {
     const { date, stage } = req.query;
     try {
-      db.prepare(`
-        DELETE FROM attendance 
-        WHERE date = ? AND student_id IN (SELECT id FROM students WHERE stage = ?)
-      `).run(date, stage);
+      const studentsInStage = await Student.find({ stage }, '_id');
+      const studentIds = studentsInStage.map(s => s._id);
+      await Attendance.deleteMany({ date, student_id: { $in: studentIds } });
       res.json({ success: true });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
     }
   });
 
-  app.delete("/api/students/stage", (req, res) => {
-    const { stage } = req.query;
-    try {
-      const transaction = db.transaction(() => {
-        db.prepare("DELETE FROM attendance WHERE student_id IN (SELECT id FROM students WHERE stage = ?)").run(stage);
-        db.prepare("DELETE FROM students WHERE stage = ?").run(stage);
-      });
-      transaction();
-      res.json({ success: true });
-    } catch (error) {
-      res.status(500).json({ success: false, error: error.message });
-    }
-  });
-
-  app.post("/api/students/bulk-upload", (req, res) => {
+  // رفع جماعي للطلاب (يمسح المرحلة القديمة ويضيف الجديد)
+  app.post("/api/students/bulk-upload", async (req, res) => {
     const { students } = req.body;
-    
-    const stagesInFile = [...new Set(students.map((s: any) => s.stage))];
-    
-    const deleteStageStudents = db.prepare("DELETE FROM students WHERE stage = ?");
-    const deleteStageAttendance = db.prepare("DELETE FROM attendance WHERE student_id IN (SELECT id FROM students WHERE stage = ?)");
-    const insert = db.prepare("INSERT INTO students (name, stage, class_name) VALUES (?, ?, ?)");
-    
-    const transaction = db.transaction((data) => {
-      for (const stage of stagesInFile) {
-        deleteStageAttendance.run(stage);
-        deleteStageStudents.run(stage);
-      }
-      for (const student of data) {
-        insert.run(student.name, student.stage, student.className || '');
-      }
-    });
-
     try {
-      transaction(students);
-      res.json({ success: true, message: `Uploaded ${students.length} students for ${stagesInFile.length} stages` });
+      const stagesInFile = [...new Set(students.map((s: any) => s.stage))];
+      
+      // حذف الطلاب القدامى وحضورهم للمراحل الموجودة في الملف
+      const oldStudents = await Student.find({ stage: { $in: stagesInFile } }, '_id');
+      const oldStudentIds = oldStudents.map(s => s._id);
+      
+      await Attendance.deleteMany({ student_id: { $in: oldStudentIds } });
+      await Student.deleteMany({ stage: { $in: stagesInFile } });
+
+      // إضافة الطلاب الجدد
+      const docs = students.map((s: any) => ({
+        name: s.name,
+        stage: s.stage,
+        class_name: s.className || ''
+      }));
+      await Student.insertMany(docs);
+
+      res.json({ success: true, message: `تم رفع ${students.length} طالب بنجاح` });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
     }
   });
 
-  app.post("/api/students/upload", (req, res) => {
-    const { students, stage } = req.body;
-    
-    const deleteOld = db.prepare("DELETE FROM students WHERE stage = ?");
-    const insert = db.prepare("INSERT INTO students (name, stage, class_name) VALUES (?, ?, ?)");
-    
-    const transaction = db.transaction((data) => {
-      deleteOld.run(stage);
-      for (const student of data) {
-        insert.run(student.name, stage, student.className || '');
-      }
-    });
-
+  // تسجيل الحضور
+  app.post("/api/attendance", async (req, res) => {
+    const { records, date, stage } = req.body;
     try {
-      transaction(students);
-      res.json({ success: true, message: `Uploaded ${students.length} students` });
-    } catch (error) {
-      res.status(500).json({ success: false, error: error.message });
-    }
-  });
+      // حذف السجلات القديمة لنفس اليوم والمرحلة
+      const studentsInStage = await Student.find({ stage }, '_id');
+      const studentIds = studentsInStage.map(s => s._id);
+      await Attendance.deleteMany({ date, student_id: { $in: studentIds } });
 
-  app.post("/api/attendance", (req, res) => {
-    const { records, date } = req.body;
-    
-    const deleteOld = db.prepare("DELETE FROM attendance WHERE date = ? AND student_id IN (SELECT id FROM students WHERE stage = ?)");
-    const insert = db.prepare("INSERT INTO attendance (student_id, date, status) VALUES (?, ?, ?)");
-    
-    // We need the stage to delete correctly if we are updating a specific stage's attendance
-    const stage = req.body.stage;
-
-    const transaction = db.transaction((data) => {
-      deleteOld.run(date, stage);
-      for (const record of data) {
-        insert.run(record.studentId, date, record.status);
-      }
-    });
-
-    try {
-      transaction(records);
+      // إضافة السجلات الجديدة
+      const docs = records.map((r: any) => ({
+        student_id: r.studentId,
+        date,
+        status: r.status
+      }));
+      await Attendance.insertMany(docs);
       res.json({ success: true });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
     }
   });
 
-  app.get("/api/attendance/history", (req, res) => {
-    const { date, stage } = req.query;
-    const records = db.prepare(`
-      SELECT a.* FROM attendance a
-      JOIN students s ON a.student_id = s.id
-      WHERE a.date = ? AND s.stage = ?
-    `).all(date, stage);
-    res.json(records);
+  // ملخص الغياب والحضور لمرحلة (شهري)
+  app.get("/api/attendance/monthly-summary", async (req, res) => {
+    const { month, stage } = req.query;
+    try {
+      const students = await Student.find({ stage }).sort({ name: 1 });
+      const summary = await Promise.all(students.map(async (student) => {
+        const attendance = await Attendance.find({
+          student_id: student._id,
+          date: { $regex: `^${month}` }
+        });
+        return {
+          id: student._id,
+          name: student.name,
+          className: student.class_name,
+          present_count: attendance.filter(a => a.status === 'present').length,
+          absent_count: attendance.filter(a => a.status === 'absent').length
+        };
+      }));
+      res.json(summary);
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
   });
 
-  app.get("/api/attendance/summary", (req, res) => {
-    const { date } = req.query;
-    const summary = db.prepare(`
-      SELECT 
-        s.stage,
-        COUNT(CASE WHEN a.status = 'present' THEN 1 END) as present_count,
-        COUNT(CASE WHEN a.status = 'absent' THEN 1 END) as absent_count,
-        (SELECT COUNT(*) FROM students s2 WHERE s2.stage = s.stage) as total_students
-      FROM students s
-      LEFT JOIN attendance a ON s.id = a.student_id AND a.date = ?
-      GROUP BY s.stage
-    `).all(date);
-    res.json(summary);
-  });
-
-  app.get("/api/attendance/monthly-summary", (req, res) => {
-    const { month, stage } = req.query; // month format: YYYY-MM
-    const summary = db.prepare(`
-      SELECT 
-        s.id,
-        s.name,
-        s.class_name as className,
-        COUNT(CASE WHEN a.status = 'present' THEN 1 END) as present_count,
-        COUNT(CASE WHEN a.status = 'absent' THEN 1 END) as absent_count
-      FROM students s
-      LEFT JOIN attendance a ON s.id = a.student_id AND a.date LIKE ?
-      WHERE s.stage = ?
-      GROUP BY s.id
-      ORDER BY s.name ASC
-    `).all(`${month}%`, stage);
-    res.json(summary);
-  });
-
-  app.get("/api/attendance/absent-students", (req, res) => {
-    const { date, stage } = req.query;
-    const students = db.prepare(`
-      SELECT s.name, s.class_name as className
-      FROM students s
-      JOIN attendance a ON s.id = a.student_id
-      WHERE a.date = ? AND s.stage = ? AND a.status = 'absent'
-      ORDER BY s.name ASC
-    `).all(date, stage);
-    res.json(students);
-  });
-
-  // Vite middleware for development
+  // --- 4. تشغيل Vite أو ملفات الإنتاج ---
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -216,7 +151,7 @@ async function startServer() {
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`🚀 السيرفر يعمل على منفذ: ${PORT}`);
   });
 }
 
