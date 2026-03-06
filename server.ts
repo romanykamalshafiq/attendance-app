@@ -8,7 +8,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // --- 1. إعدادات MongoDB ---
 // استبدل الرابط التالي برابط MongoDB Atlas الخاص بك
-const MONGO_URI = "mongodb+srv://admin:password@cluster0.mongodb.net/ChurchAttendance?retryWrites=true&w=majority";
+const MONGO_URI = "mongodb+srv://robbenmarkos_db_user:jMPp6g6JbRSJ7HZp@cluster0.gdopuh3.mongodb.net/?appName=Cluster0";
 
 mongoose.connect(MONGO_URI)
   .then(() => console.log("✅ متصل بـ MongoDB Atlas بنجاح"))
