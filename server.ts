@@ -3,12 +3,13 @@ import { createServer as createViteServer } from "vite";
 import mongoose from "mongoose";
 import path from "path";
 import { fileURLToPath } from "url";
+import cors from "cors";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// --- 1. إعدادات MongoDB ---
-// استبدل الرابط التالي برابط MongoDB Atlas الخاص بك
-const MONGO_URI = "mongodb+srv://robbenmarkos_db_user:jMPp6g6JbRSJ7HZp@cluster0.gdopuh3.mongodb.net/?appName=Cluster0";
+// --- 1. إعدادات MongoDB Atlas ---
+// هذا الرابط يحتوي على اسم المستخدم وكلمة المرور الصحيحة التي استخرجناها من لقطات الشاشة الخاصة بك
+const MONGO_URI = "mongodb+srv://robbenmarkos_db_user:jMPp6gJbRSJ7HZp@cluster0.gdopuh3.mongodb.net/ChurchAttendance?retryWrites=true&w=majority&appName=Cluster0";
 
 mongoose.connect(MONGO_URI)
   .then(() => console.log("✅ متصل بـ MongoDB Atlas بنجاح"))
@@ -23,7 +24,7 @@ const studentSchema = new mongoose.Schema({
 
 const attendanceSchema = new mongoose.Schema({
   student_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Student', required: true },
-  date: { type: String, required: true }, // Format: YYYY-MM-DD
+  date: { type: String, required: true }, // صيغة التاريخ: YYYY-MM-DD
   status: { type: String, enum: ['present', 'absent'], required: true }
 });
 
@@ -34,6 +35,7 @@ async function startServer() {
   const app = express();
   const PORT = process.env.PORT || 3000;
 
+  app.use(cors());
   app.use(express.json({ limit: '50mb' }));
 
   // --- 3. الـ API Routes ---
@@ -63,20 +65,18 @@ async function startServer() {
     }
   });
 
-  // رفع جماعي للطلاب (يمسح المرحلة القديمة ويضيف الجديد)
+  // الرفع الجماعي للطلاب (Excel)
   app.post("/api/students/bulk-upload", async (req, res) => {
     const { students } = req.body;
     try {
       const stagesInFile = [...new Set(students.map((s: any) => s.stage))];
       
-      // حذف الطلاب القدامى وحضورهم للمراحل الموجودة في الملف
       const oldStudents = await Student.find({ stage: { $in: stagesInFile } }, '_id');
       const oldStudentIds = oldStudents.map(s => s._id);
       
       await Attendance.deleteMany({ student_id: { $in: oldStudentIds } });
       await Student.deleteMany({ stage: { $in: stagesInFile } });
 
-      // إضافة الطلاب الجدد
       const docs = students.map((s: any) => ({
         name: s.name,
         stage: s.stage,
@@ -86,73 +86,4 @@ async function startServer() {
 
       res.json({ success: true, message: `تم رفع ${students.length} طالب بنجاح` });
     } catch (error) {
-      res.status(500).json({ success: false, error: error.message });
-    }
-  });
-
-  // تسجيل الحضور
-  app.post("/api/attendance", async (req, res) => {
-    const { records, date, stage } = req.body;
-    try {
-      // حذف السجلات القديمة لنفس اليوم والمرحلة
-      const studentsInStage = await Student.find({ stage }, '_id');
-      const studentIds = studentsInStage.map(s => s._id);
-      await Attendance.deleteMany({ date, student_id: { $in: studentIds } });
-
-      // إضافة السجلات الجديدة
-      const docs = records.map((r: any) => ({
-        student_id: r.studentId,
-        date,
-        status: r.status
-      }));
-      await Attendance.insertMany(docs);
-      res.json({ success: true });
-    } catch (error) {
-      res.status(500).json({ success: false, error: error.message });
-    }
-  });
-
-  // ملخص الغياب والحضور لمرحلة (شهري)
-  app.get("/api/attendance/monthly-summary", async (req, res) => {
-    const { month, stage } = req.query;
-    try {
-      const students = await Student.find({ stage }).sort({ name: 1 });
-      const summary = await Promise.all(students.map(async (student) => {
-        const attendance = await Attendance.find({
-          student_id: student._id,
-          date: { $regex: `^${month}` }
-        });
-        return {
-          id: student._id,
-          name: student.name,
-          className: student.class_name,
-          present_count: attendance.filter(a => a.status === 'present').length,
-          absent_count: attendance.filter(a => a.status === 'absent').length
-        };
-      }));
-      res.json(summary);
-    } catch (error) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // --- 4. تشغيل Vite أو ملفات الإنتاج ---
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-  } else {
-    app.use(express.static(path.join(__dirname, "dist")));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(__dirname, "dist", "index.html"));
-    });
-  }
-
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`🚀 السيرفر يعمل على منفذ: ${PORT}`);
-  });
-}
-
-startServer();
+      res.status
